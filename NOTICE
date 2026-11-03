@@ -1,0 +1,72 @@
+DocuCraft: document conversion core, command line tool and desktop GUI
+Copyright (C) 2026 DocuCraft contributors
+
+Licensed under the GNU Affero General Public License v3.0 or later
+(AGPL-3.0-or-later). See LICENSE.
+
+Third-party components
+----------------------
+
+MuPDF 1.24.10 with DocuCraft changes (cpp/third_party/mupdf-src, git submodule)
+  Copyright (C) 2006-2024 Artifex Software, Inc.
+  Licensed under AGPL-3.0-or-later.
+  Source of the version used here: https://github.com/Laumss/docucraft-mupdf
+  (branch docucraft/1.24.10; the changes are listed in README.DocuCraft.md).
+  Upstream: https://mupdf.com/
+  Statically linked when HARDCOPY_PDFIN=ON: PDF input, PDF page rendering,
+  the EPUB layout engine, JPEG encoding. libmupdf-third bundles further
+  libraries (FreeType, HarfBuzz, libjpeg, OpenJPEG, jbig2dec, lcms2mt, zlib,
+  gumbo-parser, MuJS, extract), each under its own license; see the
+  thirdparty/ directory of the MuPDF source.
+
+FreeType 2.13.2 (cpp/third_party/freetype)
+  Portions of this software are copyright (C) 2023 The FreeType Project
+  (https://freetype.org). All rights reserved.
+  Used under the FreeType License (see docs/FTL.TXT in that directory).
+
+Dear ImGui 1.90.4 (cpp/third_party/imgui)
+  Copyright (c) 2014-2024 Omar Cornut. MIT License (see LICENSE.txt).
+  Used by the desktop GUI only.
+
+libdeflate 1.26 (cpp/third_party/libdeflate)
+  Copyright 2016 Eric Biggers, Copyright 2024 Google LLC. MIT License (see COPYING).
+
+libjpeg-turbo 3.0.3 (cpp/third_party/libjpeg-turbo)
+  IJG License, Modified (3-clause) BSD License and zlib License (see LICENSE.md).
+  Used only when MuPDF is not available.
+
+libwebp 1.6.0 (cpp/third_party/libwebp, decoder sources only)
+  Copyright 2010 Google Inc. BSD 3-Clause License with an additional patent
+  grant (see COPYING and PATENTS).
+
+minizip-ng 4.0.7 (cpp/third_party/minizip-ng)
+  zlib License (see LICENSE).
+
+nlohmann/json 3.11.3 (cpp/third_party/nlohmann-json)
+  Copyright (c) 2013-2022 Niels Lohmann. MIT License (see LICENSE.MIT).
+
+pugixml 1.14 (cpp/third_party/pugixml)
+  Copyright (c) 2006-2023 Arseny Kapoulkine. MIT License (see LICENSE.md).
+
+stb (cpp/third_party/stb)
+  Copyright (c) 2017 Sean Barrett. MIT License or public domain (see LICENSE).
+
+ncnn 20261020 (not in the repository; see cpp/third_party/ncnn/README.md)
+  Copyright (C) 2017 Tencent. BSD 3-Clause License (see
+  cpp/third_party/ncnn/LICENSE.txt). Source: https://github.com/Tencent/ncnn/tree/20261020
+  Linked when the prebuilt libraries are present, for OCR.
+
+PP-OCRv5 mobile models (cpp/third_party/ppocr)
+  Models by PaddlePaddle PaddleOCR, Apache License 2.0
+  (https://github.com/PaddlePaddle/PaddleOCR). ncnn conversions, character
+  dictionary (ppocrv5_dict.h) and the detection/recognition pipeline that
+  cpp/hardcopy/ocr/ppocr.cpp is adapted from by Tencent, BSD 3-Clause
+  (https://github.com/nihui/ncnn-android-ppocrv5). Embedded in the library.
+
+OpenCC dictionaries (cpp/hardcopy/parser/zh_convert_table.inc,
+zh_phrase_table.inc, STCharacters.txt, TSCharacters.txt)
+  Copyright (c) 2010-2024 Carbo Kuo and contributors. Apache License 2.0.
+  https://github.com/BYVoid/OpenCC
+  Character tables are the first variant of STCharacters/TSCharacters;
+  phrase tables are generated from STPhrases/TSPhrases by
+  scripts/gen_zh_phrases.py.

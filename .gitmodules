@@ -1,0 +1,4 @@
+[submodule "cpp/third_party/mupdf-src"]
+	path = cpp/third_party/mupdf-src
+	url = https://github.com/Laumss/docucraft-mupdf.git
+	branch = docucraft/1.24.10

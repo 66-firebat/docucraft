@@ -1,0 +1,23 @@
+add_executable(hardcopy-cli
+    main.cpp
+)
+if(WIN32)
+    target_sources(hardcopy-cli PRIVATE list_fonts.cpp list_fonts_gdi.cpp)
+else()
+    target_sources(hardcopy-cli PRIVATE list_fonts_stub.cpp)
+endif()
+target_link_libraries(hardcopy-cli PRIVATE hardcopy_core)
+target_compile_features(hardcopy-cli PRIVATE cxx_std_17)
+if(HARDCOPY_TEXT_MODE)
+    target_compile_definitions(hardcopy-cli PRIVATE HARDCOPY_HAS_TEXT_MODE=1)
+endif()
+if(HARDCOPY_PRINT AND HARDCOPY_DITHER)
+    target_compile_definitions(hardcopy-cli PRIVATE HARDCOPY_HAS_PRINT=1)
+endif()
+if(WIN32)
+    target_link_libraries(hardcopy-cli PRIVATE shell32 advapi32 dwrite ole32 gdi32)
+endif()
+
+if(HARDCOPY_PDFIN)
+    target_link_options(hardcopy-cli PRIVATE "-Wl,--allow-multiple-definition")
+endif()
