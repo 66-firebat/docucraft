@@ -49,22 +49,28 @@ void recordCodepointSize(CodepointSizeTable* table, uint32_t cp, float size) {
 }
 
 // Classify one glyph. `nominalSize` is the cached full-size of the same
-// codepoint (0 if unknown); `lineBaseline` is the enclosing line's baseline,
-// used only to decide the direction (raised => superscript, lowered =>
-// subscript). Falls back to InlineKind::Text whenever the evidence is weak.
+// codepoint (0 if unknown); `lineSize` is the enclosing line's dominant size
+// and `lineBaseline` its baseline (for direction). A glyph is a script when it
+// is clearly smaller than BOTH its codepoint's full-size AND the line's
+// dominant size. Direction: a strong downward offset => subscript, a strong
+// upward offset => superscript; when the baseline offset is ambiguous (which
+// is common because the 'line baseline' is a median that the script glyphs
+// themselves perturb), default smaller => subscript, since subscripts
+// overwhelmingly dominate in technical prose.
 InlineKind classifyGlyph(float charSize, float charBaseline, float nominalSize,
-                         float lineBaseline) {
+                         float lineSize, float lineBaseline) {
     if (nominalSize <= 0.0f || charSize <= 0.0f) return InlineKind::Text;
+    // Must be clearly smaller than the line's dominant size too.
+    if (lineSize > 0.0f && charSize >= lineSize * 0.88f) return InlineKind::Text;
     // A clear size reduction is required before we even consider a script.
     if (charSize >= nominalSize * 0.85f) return InlineKind::Text;
-    // Direction from the baseline offset, in units of the glyph's own size.
+    // Direction from the baseline offset, in units of the line's size.
     const float rise = charBaseline - lineBaseline;
-    const float em = nominalSize;
-    if (rise >  0.25f * em) return InlineKind::Superscript;
-    if (rise < -0.15f * em) return InlineKind::Subscript;
-    // Smaller but no decisive offset: most likely a smaller math symbol or a
-    // glyph that differs for font reasons rather than a true script.
-    return InlineKind::Text;
+    const float em = (lineSize > 0.0f) ? lineSize : nominalSize;
+    if (rise >  0.30f * em) return InlineKind::Superscript;
+    if (rise < -0.30f * em) return InlineKind::Subscript;
+    // Smaller with no decisive offset: default to subscript (the common case).
+    return InlineKind::Subscript;
 }
 
 void appendUtf8(std::string& s, uint32_t cp) {
@@ -159,7 +165,7 @@ std::vector<InlineRun> cellRuns(fz_context* ctx, const std::vector<CellChar>& ch
             auto it = cpSizes->find((uint32_t)c);
             if (it != cpSizes->end()) nominal = it->second;
         }
-        const InlineKind kind = classifyGlyph(cc.ch->size, cc.ch->origin.y, nominal, lineBaseline);
+        const InlineKind kind = classifyGlyph(cc.ch->size, cc.ch->origin.y, nominal, lineSize, lineBaseline);
         if (started && (bold != curBold || kind != curKind) && c != ' ') flush();
         if (c != ' ') { curBold = bold; curKind = kind; }
         appendUtf8(buf, (uint32_t)c);
@@ -1129,7 +1135,7 @@ struct UntaggedAtom {
 
 bool buildLineAtom(fz_context* ctx, fz_stext_line* line,
                    const std::unordered_set<const fz_stext_char*>& skip, UntaggedAtom* a,
-                   const CodepointSizeTable* cpSizes) {
+                   const CodepointSizeTable* cpSizes, const PdfTableEvidence* ev) {
     std::vector<PageChar> store;
     for (fz_stext_char* ch = line->first_char; ch; ch = ch->next) {
         if (ch->c <= 0 || ch->c == 0xFFFD || skip.count(ch)) continue;
@@ -1175,9 +1181,76 @@ bool buildLineAtom(fz_context* ctx, fz_stext_line* line,
             if (it != cpSizes->end()) nominal = it->second;
         }
         all.add((uint32_t)pc->ch->c, isBoldFont(ctx, pc->ch->font),
-                classifyGlyph(pc->ch->size, pc->ch->origin.y, nominal, lineBase));
+                classifyGlyph(pc->ch->size, pc->ch->origin.y, nominal, a->geo.size, lineBase));
     }
     a->runs = all.take();
+
+    // ---- recover sub/superscript glyphs the stext layer dropped ---------
+    // MuPDF's structured-text device sometimes omits glyphs set in a smaller
+    // sub/superscript font (e.g. the CMR8/CMR6 subscript fonts in LaTeX math).
+    // Those glyphs ARE present in the raw device layer ('ev->textGlyphs',
+    // collected by recordText from fz_text_span/fz_text_item) with a correct
+    // Unicode ('ucs') and size/position ('box'). Recover them by position and
+    // merge so 'x<sub>1</sub>' / 'x<sup>2</sup>' read correctly.
+    if (ev && !ev->textGlyphs.empty()) {
+        const fz_rect lb = line->bbox;
+        const float yLo = lb.y0, yHi = lb.y1;
+        // Collect device glyphs in this line's vertical band that stext did
+        // not already surface (we match by position + codepoint against the
+        // stext chars we just consumed).
+        std::vector<const PdfGlyph*> orphans;
+        for (const auto& g : ev->textGlyphs) {
+            if (g.ucs <= 32) continue;
+            // glyph's vertical center must be within the line band
+            const float cy = (g.box.y0 + g.box.y1) * 0.5f;
+            if (cy < yLo || cy > yHi) continue;
+            // skip if an stext char already covers this glyph (avoid duplicates)
+            bool covered = false;
+            for (const PageChar* pc : chars) {
+                if (std::fabs(pc->ch->origin.y - g.y) < 0.35f
+                    && std::fabs(pc->ch->origin.x - g.x) < 0.35f
+                    && (uint32_t)pc->ch->c == (uint32_t)g.ucs) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (covered) continue;
+            orphans.push_back(&g);
+        }
+        if (!orphans.empty()) {
+            std::sort(orphans.begin(), orphans.end(),
+                      [](const PdfGlyph* a, const PdfGlyph* b) { return a->x < b->x; });
+            // Rebuild runs with the recovered glyphs interleaved by x.
+            RunBuilder merged;
+            size_t oi = 0;
+            auto emit = [&](uint32_t c, float size, float baseY, bool bold, float x) {
+                (void)x;
+                float nominal = 0.0f;
+                if (cpSizes) {
+                    auto it = cpSizes->find(c);
+                    if (it != cpSizes->end()) nominal = it->second;
+                }
+                merged.add(c, bold, classifyGlyph(size, baseY, nominal, a->geo.size, lineBase));
+            };
+            for (const PageChar* pc : chars) {
+                const float cx = pc->ch->origin.x;
+                while (oi < orphans.size() && orphans[oi]->x < cx) {
+                    emit((uint32_t)orphans[oi]->ucs, orphans[oi]->box.y1 - orphans[oi]->box.y0,
+                         orphans[oi]->y, false, orphans[oi]->x);
+                    ++oi;
+                }
+                emit((uint32_t)pc->ch->c, pc->ch->size, pc->ch->origin.y,
+                     isBoldFont(ctx, pc->ch->font), cx);
+            }
+            while (oi < orphans.size()) {
+                emit((uint32_t)orphans[oi]->ucs, orphans[oi]->box.y1 - orphans[oi]->box.y0,
+                     orphans[oi]->y, false, orphans[oi]->x);
+                ++oi;
+            }
+            a->runs = merged.take();
+        }
+    }
+
     const size_t from = splitListLabel(chars, &a->label, &a->ordered, &a->number, true);
     if (from > 0) {
         size_t k = from;
@@ -1197,7 +1270,7 @@ bool buildLineAtom(fz_context* ctx, fz_stext_line* line,
                 }
                 body.add((uint32_t)chars[j]->ch->c, isBoldFont(ctx, chars[j]->ch->font),
                          classifyGlyph(chars[j]->ch->size, chars[j]->ch->origin.y,
-                                       nominal, lineBase));
+                                       nominal, a->geo.size, lineBase));
             }
             a->bodyRuns = body.take();
         }
@@ -1859,7 +1932,7 @@ bool parsePdf(const std::filesystem::path& path, Document* out, Logger* log,
                         }
                         UntaggedAtom a;
                         a.page = i;
-                        if (buildLineAtom(ctx, line, tableChars, &a, &cpSizes)) atoms.push_back(std::move(a));
+                        if (buildLineAtom(ctx, line, tableChars, &a, &cpSizes, &evidence)) atoms.push_back(std::move(a));
                     }
                 }
                 const int figures = absorbVectorFigures(ctx, page, evidence, rejectedGrids, tableBoxes,
