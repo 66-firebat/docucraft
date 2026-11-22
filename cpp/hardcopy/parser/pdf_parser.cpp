@@ -1547,7 +1547,10 @@ void reconstructRaisedLabels(std::vector<UntaggedAtom>* atoms, float bodySize) {
             const float bBase = b.geo.baseline;
             const float dy = aBase - bBase;   // >0 means label is above main
             if (dy < 0.2f * em) continue;      // must be clearly above
-            if (dy > 3.0f * em) continue;      // not absurdly far
+            // A genuine transition label sits TIGHTLY over the arrow (~0.4em
+            // above). A heading on its own line is a full line-height away
+            // (~1.5em+) and must NOT be mistaken for a label.
+            if (dy > 0.7f * em) continue;
             // horizontal overlap
             const float ox = std::min(aBox.x1, b.box.x1) - std::max(aBox.x0, b.box.x0);
             if (ox <= 0.2f * em) continue;
