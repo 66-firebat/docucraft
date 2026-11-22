@@ -1135,7 +1135,8 @@ struct UntaggedAtom {
 
 bool buildLineAtom(fz_context* ctx, fz_stext_line* line,
                    const std::unordered_set<const fz_stext_char*>& skip, UntaggedAtom* a,
-                   const CodepointSizeTable* cpSizes, const PdfTableEvidence* ev) {
+                   const CodepointSizeTable* cpSizes, const PdfTableEvidence* ev,
+                   const std::vector<bool>* consumed) {
     std::vector<PageChar> store;
     for (fz_stext_char* ch = line->first_char; ch; ch = ch->next) {
         if (ch->c <= 0 || ch->c == 0xFFFD || skip.count(ch)) continue;
@@ -1199,7 +1200,9 @@ bool buildLineAtom(fz_context* ctx, fz_stext_line* line,
         // not already surface (we match by position + codepoint against the
         // stext chars we just consumed).
         std::vector<const PdfGlyph*> orphans;
-        for (const auto& g : ev->textGlyphs) {
+        for (size_t gi = 0; gi < ev->textGlyphs.size(); ++gi) {
+            if (consumed && (*consumed)[gi]) continue;   // already matched to stext elsewhere
+            const auto& g = ev->textGlyphs[gi];
             if (g.ucs <= 32) continue;
             // glyph's vertical center must be within the line band
             const float cy = (g.box.y0 + g.box.y1) * 0.5f;
@@ -1829,6 +1832,26 @@ bool parsePdf(const std::filesystem::path& path, Document* out, Logger* log,
             int visibleChars = 0, taggedChars = 0;
             const std::vector<PageChar> pageChars =
                 tagPageChars(stext, evidence, tableChars, &visibleChars, &taggedChars);
+
+            // Mark which device-layer glyphs are already spoken for by stext,
+            // so the sub/superscript recovery in buildLineAtom only picks up
+            // glyphs the structured-text layer genuinely dropped (avoiding the
+            // duplicate/interleaved text that results from re-adding body
+            // glyphs that stext already emitted).
+            std::vector<bool> consumedGlyphs(evidence.textGlyphs.size(), false);
+            {
+                const PdfGlyphLookup lookup(evidence);
+                for (fz_stext_block* tb = stext->first_block; tb; tb = tb->next) {
+                    if (tb->type != FZ_STEXT_BLOCK_TEXT) continue;
+                    for (fz_stext_line* l = tb->u.t.first_line; l; l = l->next)
+                        for (fz_stext_char* ch = l->first_char; ch; ch = ch->next) {
+                            if (ch->c <= 0 || ch->c == 0xFFFD) continue;
+                            const int g = lookup.find(ch->origin, ch->c);
+                            if (g >= 0) consumedGlyphs[g] = true;
+                        }
+                }
+            }
+
             bool pageImages = false;
             for (fz_stext_block* tb = stext->first_block; tb && !pageImages; tb = tb->next)
                 pageImages = tb->type == FZ_STEXT_BLOCK_IMAGE;
@@ -1932,7 +1955,7 @@ bool parsePdf(const std::filesystem::path& path, Document* out, Logger* log,
                         }
                         UntaggedAtom a;
                         a.page = i;
-                        if (buildLineAtom(ctx, line, tableChars, &a, &cpSizes, &evidence)) atoms.push_back(std::move(a));
+                        if (buildLineAtom(ctx, line, tableChars, &a, &cpSizes, &evidence, &consumedGlyphs)) atoms.push_back(std::move(a));
                     }
                 }
                 const int figures = absorbVectorFigures(ctx, page, evidence, rejectedGrids, tableBoxes,
