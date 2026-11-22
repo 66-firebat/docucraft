@@ -1437,18 +1437,11 @@ int absorbVectorFigures(fz_context* ctx, fz_page* page, const PdfTableEvidence& 
 // ---------------------------------------------------------------------------
 namespace {
 
-// Merge a short raised label atom (b) into the run text of a main atom (a) at
-// the position of the token it overlies. Returns true if merged.
-bool spliceRaisedLabel(UntaggedAtom* a, UntaggedAtom* b) {
-    if (!a->line || !b->line) return false;
-    if (b->runs.empty()) return false;
-
-    // The floating label's own text (joined, trimmed).
-    std::string label;
-    for (const auto& r : b->runs) label += r.text;
-    while (!label.empty() && (label.back() == ' ' || label.back() == '\t')) label.pop_back();
-    while (!label.empty() && (label.front() == ' ' || label.front() == '\t')) label.erase(0, 1);
-    if (label.empty()) return false;
+// Merge a raised-label string into the run text of a main atom (a) at the
+// position of the token it overlies. The label text is already joined/trimmed
+// by the caller. Returns true on success.
+bool spliceRaisedLabelText(UntaggedAtom* a, const std::string& label) {
+    if (!a->line || label.empty()) return false;
 
     // Find the arrow (a run of '-'/'−' immediately followed by '→') in a's runs.
     // We walk a.runs as a single string with per-run offsets so we can insert
@@ -1488,8 +1481,6 @@ bool spliceRaisedLabel(UntaggedAtom* a, UntaggedAtom* b) {
         nr.push_back(InlineRun{InlineKind::Text, combined, 0});
         for (auto& r : a->runs) nr.push_back(r);
         a->runs = std::move(nr);
-        b->runs.clear();
-        b->labelOnly = true;
         return true;
     }
 
@@ -1521,8 +1512,6 @@ bool spliceRaisedLabel(UntaggedAtom* a, UntaggedAtom* b) {
 
     a->runs.clear();
     a->runs.push_back(InlineRun{InlineKind::Text, combined, 0});
-    b->runs.clear();
-    b->labelOnly = true;
     return true;
 }
 
@@ -1533,40 +1522,69 @@ bool spliceRaisedLabel(UntaggedAtom* a, UntaggedAtom* b) {
 void reconstructRaisedLabels(std::vector<UntaggedAtom>* atoms, float bodySize) {
     if (!atoms || atoms->size() < 2) return;
     const float em = std::max(1.0f, bodySize);
-    // A label is "raised" when its baseline is clearly above the main line's.
-    // (MuPDF y grows upward, so a raised/superscript glyph has a larger y? No:
-    // a glyph printed above the line has its ORIGIN higher, i.e. larger y.)
-    // Cross-check with source: the tau label baseline was 462.46 vs main 467.02,
-    // i.e. SMALLER y. So "raised" here means LOWER y in MuPDF coords.
+    // A label is "raised" when its baseline (geo.baseline) sits above the
+    // main line's baseline. In MuPDF's y-up coordinates, a glyph printed
+    // ABOVE the line has a SMALLER origin.y, so "above" means
+    // label.baseline < main.baseline.
     for (size_t i = 0; i < atoms->size(); ++i) {
         UntaggedAtom& a = (*atoms)[i];
         if (!a.line || a.runs.empty()) continue;
-        const float aBaseline = a.geo.baseline;
+        const float aBase = a.geo.baseline;
         const fz_rect aBox = a.box;
-        int best = -1;
-        float bestScore = 1e9f;
+        // collect candidate labels
+        std::vector<int> labels;
         for (size_t j = 0; j < atoms->size(); ++j) {
-            if (i == j) continue;
+            if ((int)i == (int)j) continue;
             UntaggedAtom& b = (*atoms)[j];
             if (!b.line || b.runs.empty()) continue;
-            const float bBaseline = b.geo.baseline;
-            const float dy = aBaseline - bBaseline;   // >0 means b is above a
-            // b must be clearly above a (lower y = higher on page).
-            if (dy < 0.25f * em) continue;
-            if (dy > 2.5f * em) continue;
-            // x-overlap between the label and the main line.
+            const float bBase = b.geo.baseline;
+            const float dy = aBase - bBase;   // >0 means label is above main
+            if (dy < 0.2f * em) continue;      // must be clearly above
+            if (dy > 3.0f * em) continue;      // not absurdly far
+            // horizontal overlap
             const float ox = std::min(aBox.x1, b.box.x1) - std::max(aBox.x0, b.box.x0);
-            if (ox <= 0.0f) continue;
-            // the label should be short.
+            if (ox <= 0.2f * em) continue;
+            // short label
             size_t bLen = 0;
             for (const auto& r : b.runs) bLen += r.text.size();
             if (bLen > 16) continue;
-            // score: prefer smallest dy and largest overlap.
-            const float score = std::fabs(dy) - ox;
-            if (score < bestScore) { bestScore = score; best = (int)j; }
+            labels.push_back((int)j);
         }
-        if (best >= 0) {
-            spliceRaisedLabel(&a, &(*atoms)[best]);
+        if (labels.empty()) continue;
+
+        // Group labels by their baseline (so words on the same raised line
+        // join with a space, e.g. "insert" + "coin"). Sort each group by x.
+        std::sort(labels.begin(), labels.end(), [&](int p, int q) {
+            const UntaggedAtom& x = (*atoms)[p];
+            const UntaggedAtom& y = (*atoms)[q];
+            if (std::fabs(x.geo.baseline - y.geo.baseline) > 0.3f * em)
+                return x.geo.baseline < y.geo.baseline;
+            return x.box.x0 < y.box.x0;
+        });
+
+        // Build the joined label text.
+        std::string joined;
+        std::vector<int> consumed;
+        float lastBaseline = 1e9f;
+        for (int j : labels) {
+            UntaggedAtom& b = (*atoms)[j];
+            std::string word;
+            for (const auto& r : b.runs) word += r.text;
+            while (!word.empty() && (word.back() == ' ' || word.back() == '\t')) word.pop_back();
+            while (!word.empty() && (word.front() == ' ' || word.front() == '\t')) word.erase(0, 1);
+            if (word.empty()) continue;
+            if (!joined.empty()) joined += ' ';
+            joined += word;
+            consumed.push_back(j);
+        }
+        if (joined.empty()) continue;
+        if (joined.size() > 24) continue;   // sanity: not a real label
+
+        // Splice the joined label into the arrow (or prepend for non-arrow).
+        spliceRaisedLabelText(&a, joined);
+        for (int j : consumed) {
+            (*atoms)[j].runs.clear();
+            (*atoms)[j].labelOnly = true;
         }
     }
 }
