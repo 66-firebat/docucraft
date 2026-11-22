@@ -181,7 +181,7 @@ void recordText(fz_context* ctx, PdfTableEvidence* ev, const fz_text* text, fz_m
     for (const fz_text_span* span = text->head; span; span = span->next) {
         for (int i = 0; i < span->len; ++i) {
             const fz_text_item& item = span->items[i];
-            if (item.ucs < 0) continue;
+            if (item.ucs < 0 || item.ucs == 0xFFFD) continue;
             if (item.ucs > 32) {
                 ++ev->textChars;
                 ev->invisibleChars += invisible;

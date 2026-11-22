@@ -1203,7 +1203,7 @@ bool buildLineAtom(fz_context* ctx, fz_stext_line* line,
         for (size_t gi = 0; gi < ev->textGlyphs.size(); ++gi) {
             if (consumed && (*consumed)[gi]) continue;   // already matched to stext elsewhere
             const auto& g = ev->textGlyphs[gi];
-            if (g.ucs <= 32) continue;
+            if (g.ucs <= 32 || g.ucs == 0xFFFD) continue;
             // glyph's vertical center must be within the line band
             const float cy = (g.box.y0 + g.box.y1) * 0.5f;
             if (cy < yLo || cy > yHi) continue;
