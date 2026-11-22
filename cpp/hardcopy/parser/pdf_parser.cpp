@@ -26,6 +26,45 @@ namespace hardcopy {
 
 namespace {
 
+// Classify a character as subscript / superscript / normal text from the
+// authoritative glyph metrics that MuPDF's structured-text layer extracted
+// from the device layer (trm matrix expansion = font size, glyph origin =
+// baseline position including the PDF text-rise 'Ts' operator).
+//
+//   charSize     font size of this glyph (fz_stext_char::size)
+//   charBaseline baseline y of this glyph, already rise-adjusted (origin.y)
+//   lineSize     median font size of the enclosing line
+//   lineBaseline median baseline of the enclosing line
+//
+// A PDF has no explicit sub/superscript flag: it is encoded by a smaller
+// 'Tf' font size and a non-zero 'Ts' text rise. We reconstruct it by
+// comparing each glyph against the line's dominant size/baseline.
+InlineKind classifyScript(float charSize, float charBaseline,
+                          float lineSize, float lineBaseline) {
+    if (lineSize <= 0.0f || charSize <= 0.0f) return InlineKind::Text;
+    // MuPDF reports the baseline of a glyph; for a smaller glyph (sub/super)
+    // the baseline shifts. For superscripts the glyph is raised (its baseline
+    // is HIGHER on the page, i.e. a larger y), for subscripts it is lowered.
+    // Note: fz_stext_char.origin.y is the glyph origin (bottom-left of the
+    // glyph box); a superscript's origin sits ABOVE the line baseline, a
+    // subscript's below it.
+    const float rise = charBaseline - lineBaseline;
+    const float sizeRatio = charSize / lineSize;
+
+    // Only act on a clearly smaller glyph; same-size text is never a script.
+    if (sizeRatio > 0.88f) return InlineKind::Text;
+
+    // Strong vertical offset decides the direction. Thresholds in em of the
+    // LINE size (an offset of ~0.30 em is unambiguous).
+    if (rise >  0.28f * lineSize) return InlineKind::Superscript;
+    if (rise < -0.18f * lineSize) return InlineKind::Subscript;
+
+    // A smaller glyph with only a slight offset is ambiguous (could be a
+    // math symbol such as '*' set in a smaller nominal size). Leave it as
+    // normal text to avoid false positives.
+    return InlineKind::Text;
+}
+
 void appendUtf8(std::string& s, uint32_t cp) {
     if (cp < 0x80) {
         s.push_back((char)cp);
@@ -80,11 +119,26 @@ std::vector<InlineRun> cellRuns(fz_context* ctx, const std::vector<CellChar>& ch
     std::vector<InlineRun> runs;
     std::string buf;
     bool curBold = false, started = false;
+    InlineKind curKind = InlineKind::Text;
     const fz_stext_line* curLine = nullptr;
     int last = 0;
+    // Compute the cell's dominant font size and baseline to classify scripts.
+    std::vector<float> csizes, cbaselines;
+    for (const auto& cc : chars) {
+        if (cc.ch->c <= 32) continue;
+        csizes.push_back(cc.ch->size);
+        cbaselines.push_back(cc.ch->origin.y);
+    }
+    float lineSize = 0.0f, lineBaseline = 0.0f;
+    if (!csizes.empty()) {
+        std::nth_element(csizes.begin(), csizes.begin() + csizes.size() / 2, csizes.end());
+        std::nth_element(cbaselines.begin(), cbaselines.begin() + cbaselines.size() / 2, cbaselines.end());
+        lineSize = csizes[csizes.size() / 2];
+        lineBaseline = cbaselines[cbaselines.size() / 2];
+    }
     auto flush = [&] {
         if (buf.empty()) return;
-        runs.push_back(InlineRun{curBold ? InlineKind::Strong : InlineKind::Text, std::move(buf), 0});
+        runs.push_back(InlineRun{curBold ? InlineKind::Strong : curKind, std::move(buf), 0});
         buf.clear();
     };
     for (const auto& cc : chars) {
@@ -96,8 +150,9 @@ std::vector<InlineRun> cellRuns(fz_context* ctx, const std::vector<CellChar>& ch
         curLine = cc.line;
         if (!started && c == ' ') continue;
         const bool bold = isBoldFont(ctx, cc.ch->font);
-        if (started && bold != curBold && c != ' ') flush();
-        if (c != ' ') curBold = bold;
+        const InlineKind kind = classifyScript(cc.ch->size, cc.ch->origin.y, lineSize, lineBaseline);
+        if (started && (bold != curBold || kind != curKind) && c != ' ') flush();
+        if (c != ' ') { curBold = bold; curKind = kind; }
         appendUtf8(buf, (uint32_t)c);
         started = true;
         last = c;
@@ -485,10 +540,11 @@ struct RunBuilder {
     std::vector<InlineRun> runs;
     std::string buf;
     bool bold = false;
+    InlineKind kind = InlineKind::Text;
     bool empty() const { return runs.empty() && buf.empty(); }
     void flush() {
         if (buf.empty()) return;
-        runs.push_back(InlineRun{bold ? InlineKind::Strong : InlineKind::Text, std::move(buf), 0});
+        runs.push_back(InlineRun{bold ? InlineKind::Strong : kind, std::move(buf), 0});
         buf.clear();
     }
     std::string& tail() { return !buf.empty() || runs.empty() ? buf : runs.back().text; }
@@ -510,6 +566,19 @@ struct RunBuilder {
         }
         if (b != bold && !buf.empty()) flush();
         bold = b;
+        appendUtf8(buf, c);
+    }
+    void add(uint32_t c, bool b, InlineKind k) {
+        if (c == ' ' || c == '\t') {
+            if (empty() || (!tail().empty() && tail().back() == ' ')) return;
+            buf.push_back(' ');
+            return;
+        }
+        // Flush when the script kind changes, so each sub/superscript span is
+        // its own InlineRun (the layout only honours the kind at run level).
+        if ((b != bold || k != kind) && !buf.empty()) flush();
+        bold = b;
+        kind = k;
         appendUtf8(buf, c);
     }
     void wrap(uint32_t next) {
@@ -1088,7 +1157,9 @@ bool buildLineAtom(fz_context* ctx, fz_stext_line* line,
     }
     a->geo.firstWordW = wordEnd - a->box.x0;
     RunBuilder all;
-    for (const PageChar* pc : chars) all.add((uint32_t)pc->ch->c, isBoldFont(ctx, pc->ch->font));
+    for (const PageChar* pc : chars)
+        all.add((uint32_t)pc->ch->c, isBoldFont(ctx, pc->ch->font),
+                classifyScript(pc->ch->size, pc->ch->origin.y, a->geo.size, a->geo.baseline));
     a->runs = all.take();
     const size_t from = splitListLabel(chars, &a->label, &a->ordered, &a->number, true);
     if (from > 0) {
@@ -1102,7 +1173,9 @@ bool buildLineAtom(fz_context* ctx, fz_stext_line* line,
             a->geo.itemOrdered = a->ordered;
             RunBuilder body;
             for (size_t j = from; j < chars.size(); ++j)
-                body.add((uint32_t)chars[j]->ch->c, isBoldFont(ctx, chars[j]->ch->font));
+                body.add((uint32_t)chars[j]->ch->c, isBoldFont(ctx, chars[j]->ch->font),
+                         classifyScript(chars[j]->ch->size, chars[j]->ch->origin.y,
+                                        a->geo.size, a->geo.baseline));
             a->bodyRuns = body.take();
         }
     } else {
