@@ -660,11 +660,15 @@ size_t splitListLabel(const std::vector<const PageChar*>& chars, std::string* la
     const size_t next = skipSpaces(k + 1);
     const bool gap = next < chars.size() && chars[next]->line == chars[k]->line &&
         fz_rect_from_quad(chars[next]->ch->quad).x0 - charBox(first).x1 >= 0.35f * first->size;
-    const bool dash = strict && isDashBullet((uint32_t)first->c);
-    // A list marker is never a word character: bullets live in the symbol
-    // blocks, while a Greek/math/CJK letter (e.g. ϱ) is a real glyph that must
-    // not be mistaken for a bullet just because it is followed by a gap.
-    if ((isBulletChar((uint32_t)first->c) && !dash) || (gap && !isWordChar((uint32_t)first->c))) {
+    // A dash ('-', U+2212, en/em dash) is a bullet ONLY when it stands alone
+    // (followed by whitespace). Inside an arrow fragment '--αn→sn' the leading
+    // dash is immediately followed by another dash/letter, so it is NOT a
+    // bullet. Genuine bullets are only the curated symbol list in isBulletChar;
+    // math operators, arrows, '=', and '.' are never bullets.
+    const bool isDash = isDashBullet((uint32_t)first->c);
+    const bool dashFollowedByGap = (next < chars.size()) && (chars[next]->ch->c <= 32);
+    const bool realBullet = isBulletChar((uint32_t)first->c) && (!isDash || dashFollowedByGap);
+    if (realBullet) {
         *ordered = false;
         return next;
     }
@@ -1522,6 +1526,9 @@ bool spliceRaisedLabelText(UntaggedAtom* a, const std::string& label) {
 void reconstructRaisedLabels(std::vector<UntaggedAtom>* atoms, float bodySize) {
     if (!atoms || atoms->size() < 2) return;
     const float em = std::max(1.0f, bodySize);
+    std::vector<char> remove(atoms->size(), 0);
+    std::vector<size_t> collect;
+    (void)collect;
     // A label is "raised" when its baseline (geo.baseline) sits above the
     // main line's baseline. In MuPDF's y-up coordinates, a glyph printed
     // ABOVE the line has a SMALLER origin.y, so "above" means
@@ -1582,10 +1589,18 @@ void reconstructRaisedLabels(std::vector<UntaggedAtom>* atoms, float bodySize) {
 
         // Splice the joined label into the arrow (or prepend for non-arrow).
         spliceRaisedLabelText(&a, joined);
-        for (int j : consumed) {
-            (*atoms)[j].runs.clear();
-            (*atoms)[j].labelOnly = true;
-        }
+        collect.push_back(i);
+        for (int j : consumed) remove[j] = true;
+    }
+
+    // Physically remove consumed label atoms so they do not reach the list/
+    // paragraph machinery (labelOnly would trigger a bullet-list merge).
+    if (!remove.empty()) {
+        std::vector<UntaggedAtom> kept;
+        kept.reserve(atoms->size());
+        for (size_t k = 0; k < atoms->size(); ++k)
+            if (!remove[k]) kept.push_back(std::move((*atoms)[k]));
+        *atoms = std::move(kept);
     }
 }
 
