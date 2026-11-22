@@ -660,9 +660,11 @@ size_t splitListLabel(const std::vector<const PageChar*>& chars, std::string* la
     const size_t next = skipSpaces(k + 1);
     const bool gap = next < chars.size() && chars[next]->line == chars[k]->line &&
         fz_rect_from_quad(chars[next]->ch->quad).x0 - charBox(first).x1 >= 0.35f * first->size;
-    const bool alnum = first->c < 128 && std::isalnum(first->c);
     const bool dash = strict && isDashBullet((uint32_t)first->c);
-    if ((isBulletChar((uint32_t)first->c) && !dash) || (gap && !alnum && first->c < 0x2E80)) {
+    // A list marker is never a word character: bullets live in the symbol
+    // blocks, while a Greek/math/CJK letter (e.g. ϱ) is a real glyph that must
+    // not be mistaken for a bullet just because it is followed by a gap.
+    if ((isBulletChar((uint32_t)first->c) && !dash) || (gap && !isWordChar((uint32_t)first->c))) {
         *ordered = false;
         return next;
     }
