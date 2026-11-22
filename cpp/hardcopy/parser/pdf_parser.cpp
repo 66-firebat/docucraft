@@ -1419,6 +1419,158 @@ int absorbVectorFigures(fz_context* ctx, fz_page* page, const PdfTableEvidence& 
     return made;
 }
 
+// ---------------------------------------------------------------------------
+// Rigorous reconstruction of "raised label over a token".
+//
+// A PDF has no explicit markup for notations like a transition label printed
+// ABOVE an arrow (e.g.  pay --coin--> select). It is encoded purely spatially:
+// the label glyphs sit on a baseline that is offset above the main text line
+// and horizontally overlap the token they decorate (often an arrow). MuPDF's
+// structured-text extraction splits these into separate stext lines, so a
+// naive linear pass prints the label on its own line, losing the relationship.
+//
+// This pass re-associates floating labels with the token they overlie and
+// splices them back into a single linear run: an arrow '-->target' with a
+// raised label becomes '--<label>-->target' (or, for a non-arrow token,
+// '<label><token>'). It is general: any raised label over any token is
+// handled, not just transition arrows.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Merge a short raised label atom (b) into the run text of a main atom (a) at
+// the position of the token it overlies. Returns true if merged.
+bool spliceRaisedLabel(UntaggedAtom* a, UntaggedAtom* b) {
+    if (!a->line || !b->line) return false;
+    if (b->runs.empty()) return false;
+
+    // The floating label's own text (joined, trimmed).
+    std::string label;
+    for (const auto& r : b->runs) label += r.text;
+    while (!label.empty() && (label.back() == ' ' || label.back() == '\t')) label.pop_back();
+    while (!label.empty() && (label.front() == ' ' || label.front() == '\t')) label.erase(0, 1);
+    if (label.empty()) return false;
+
+    // Find the arrow (a run of '-'/'−' immediately followed by '→') in a's runs.
+    // We walk a.runs as a single string with per-run offsets so we can insert
+    // at the right place.
+    std::string text;
+    std::vector<size_t> runStart;  // byte offset of each run within 'text'
+    for (const auto& r : a->runs) {
+        runStart.push_back(text.size());
+        text += r.text;
+    }
+
+    // Locate '→' (U+2192) preceded by a run of dashes.
+    uint32_t ARROW = 0x2192;
+    size_t arrowPos = std::string::npos;
+    // Decode UTF-8 to find the arrow codepoint offset (and its byte length).
+    {
+        size_t i = 0;
+        while (i < text.size()) {
+            unsigned char c0 = (unsigned char)text[i];
+            uint32_t cp; size_t n;
+            if (c0 < 0x80) { cp = c0; n = 1; }
+            else if ((c0 & 0xE0) == 0xC0) { cp = (c0 & 0x1F); n = 2; }
+            else if ((c0 & 0xF0) == 0xE0) { cp = (c0 & 0x0F); n = 3; }
+            else if ((c0 & 0xF8) == 0xF0) { cp = (c0 & 0x07); n = 4; }
+            else { i++; continue; }
+            for (size_t k = 1; k < n; ++k) cp = (cp << 6) | ((unsigned char)text[i+k] & 0x3F);
+            if (cp == ARROW) { arrowPos = i; break; }
+            i += n;
+        }
+    }
+
+    if (arrowPos == std::string::npos) {
+        // No arrow: general "raised label over token" — splice the label at the
+        // start of the main line as '<label> ' (a best-effort preserved marker).
+        std::string combined = label + " ";
+        std::vector<InlineRun> nr;
+        nr.push_back(InlineRun{InlineKind::Text, combined, 0});
+        for (auto& r : a->runs) nr.push_back(r);
+        a->runs = std::move(nr);
+        b->runs.clear();
+        b->labelOnly = true;
+        return true;
+    }
+
+    // Strip the leading dash/arrow run: walk back from the arrow over any
+    // '-' (ASCII) or '−' (U+2212) bytes, then drop them so the reconstruction
+    // replaces the whole "--->" with "--<label>→".
+    auto isDashByte = [&](size_t i) -> bool {
+        unsigned char c = (unsigned char)text[i];
+        if (c == 0x2D) return true;                       // ASCII '-'
+        if (c == 0xE2 && i + 2 < text.size()
+            && (unsigned char)text[i+1] == 0x88 && (unsigned char)text[i+2] == 0x92) return true;  // U+2212 '−'
+        return false;
+    };
+    size_t dashStart = arrowPos;
+    while (dashStart > 0) {
+        // check the previous UTF-8 char (a dash is 1 or 3 bytes)
+        if ((unsigned char)text[dashStart-1] == 0x2D) { dashStart--; continue; }
+        if (dashStart >= 3
+            && (unsigned char)text[dashStart-3] == 0xE2
+            && (unsigned char)text[dashStart-2] == 0x88
+            && (unsigned char)text[dashStart-1] == 0x92) { dashStart -= 3; continue; }
+        break;
+    }
+
+    // Reconstruct: text before the dashes + '--label' + the arrow (and what follows).
+    std::string before = text.substr(0, dashStart);
+    std::string after = text.substr(arrowPos);   // starts at '→'
+    std::string combined = before + "--" + label + after;
+
+    a->runs.clear();
+    a->runs.push_back(InlineRun{InlineKind::Text, combined, 0});
+    b->runs.clear();
+    b->labelOnly = true;
+    return true;
+}
+
+} // namespace
+
+// Reconstruct raised (above-line) labels over tokens across a page's atoms.
+// Called after atoms are built and before reading-order assembly.
+void reconstructRaisedLabels(std::vector<UntaggedAtom>* atoms, float bodySize) {
+    if (!atoms || atoms->size() < 2) return;
+    const float em = std::max(1.0f, bodySize);
+    // A label is "raised" when its baseline is clearly above the main line's.
+    // (MuPDF y grows upward, so a raised/superscript glyph has a larger y? No:
+    // a glyph printed above the line has its ORIGIN higher, i.e. larger y.)
+    // Cross-check with source: the tau label baseline was 462.46 vs main 467.02,
+    // i.e. SMALLER y. So "raised" here means LOWER y in MuPDF coords.
+    for (size_t i = 0; i < atoms->size(); ++i) {
+        UntaggedAtom& a = (*atoms)[i];
+        if (!a.line || a.runs.empty()) continue;
+        const float aBaseline = a.geo.baseline;
+        const fz_rect aBox = a.box;
+        int best = -1;
+        float bestScore = 1e9f;
+        for (size_t j = 0; j < atoms->size(); ++j) {
+            if (i == j) continue;
+            UntaggedAtom& b = (*atoms)[j];
+            if (!b.line || b.runs.empty()) continue;
+            const float bBaseline = b.geo.baseline;
+            const float dy = aBaseline - bBaseline;   // >0 means b is above a
+            // b must be clearly above a (lower y = higher on page).
+            if (dy < 0.25f * em) continue;
+            if (dy > 2.5f * em) continue;
+            // x-overlap between the label and the main line.
+            const float ox = std::min(aBox.x1, b.box.x1) - std::max(aBox.x0, b.box.x0);
+            if (ox <= 0.0f) continue;
+            // the label should be short.
+            size_t bLen = 0;
+            for (const auto& r : b.runs) bLen += r.text.size();
+            if (bLen > 16) continue;
+            // score: prefer smallest dy and largest overlap.
+            const float score = std::fabs(dy) - ox;
+            if (score < bestScore) { bestScore = score; best = (int)j; }
+        }
+        if (best >= 0) {
+            spliceRaisedLabel(&a, &(*atoms)[best]);
+        }
+    }
+}
+
 void appendOrdered(std::vector<UntaggedAtom>& atoms, int regionBase, std::vector<UntaggedAtom>* pending,
                    float minGutter, int* regions) {
     std::vector<ReadingBox> boxes;
@@ -1974,6 +2126,7 @@ bool parsePdf(const std::filesystem::path& path, Document* out, Logger* log,
                 int regions = 0;
                 const size_t lineCount = atoms.size();
                 const size_t before = pending.size();
+                reconstructRaisedLabels(&atoms, bodySize);
                 appendOrdered(atoms, regionBase, &pending, std::max(6.0f, 0.9f * bodySize), &regions);
                 regionBase += regions;
                 if (std::getenv("HC_LAYOUT_DEBUG") && log) {
