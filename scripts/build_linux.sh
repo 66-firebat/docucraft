@@ -21,6 +21,7 @@ command -v ninja >/dev/null 2>&1 && GENERATOR=Ninja
 
 cmake -S "$ROOT/cpp" -B "$BUILD" -G "$GENERATOR" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DCMAKE_CXX_FLAGS="-Wformat -Werror=format-security" \
     -DCMAKE_C_FLAGS="-Wformat -Werror=format-security" \
     -DHARDCOPY_BUILD_CLI=ON \
