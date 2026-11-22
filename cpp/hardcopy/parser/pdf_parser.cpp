@@ -19,6 +19,7 @@ extern "C" {
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -26,42 +27,43 @@ namespace hardcopy {
 
 namespace {
 
-// Classify a character as subscript / superscript / normal text from the
-// authoritative glyph metrics that MuPDF's structured-text layer extracted
-// from the device layer (trm matrix expansion = font size, glyph origin =
-// baseline position including the PDF text-rise 'Ts' operator).
+// Per-codepoint "nominal size" cache, built in a first pass over the whole
+// document and consulted in the second pass to classify sub/superscripts.
 //
-//   charSize     font size of this glyph (fz_stext_char::size)
-//   charBaseline baseline y of this glyph, already rise-adjusted (origin.y)
-//   lineSize     median font size of the enclosing line
-//   lineBaseline median baseline of the enclosing line
-//
-// A PDF has no explicit sub/superscript flag: it is encoded by a smaller
-// 'Tf' font size and a non-zero 'Ts' text rise. We reconstruct it by
-// comparing each glyph against the line's dominant size/baseline.
-InlineKind classifyScript(float charSize, float charBaseline,
-                          float lineSize, float lineBaseline) {
-    if (lineSize <= 0.0f || charSize <= 0.0f) return InlineKind::Text;
-    // MuPDF reports the baseline of a glyph; for a smaller glyph (sub/super)
-    // the baseline shifts. For superscripts the glyph is raised (its baseline
-    // is HIGHER on the page, i.e. a larger y), for subscripts it is lowered.
-    // Note: fz_stext_char.origin.y is the glyph origin (bottom-left of the
-    // glyph box); a superscript's origin sits ABOVE the line baseline, a
-    // subscript's below it.
+// A PDF has no explicit sub/superscript flag: a subscript or superscript is an
+// ordinary character set in a SMALLER font size (via the 'Tf'/'Tm' text matrix)
+// and shifted up/down from the baseline. So the reliable signal is not the
+// character's surrounding line, but a comparison against the SAME character's
+// full-size appearance elsewhere in the document: if a glyph is clearly smaller
+// than the largest size that same Unicode codepoint normally appears at, it is
+// a script (subscript if lowered, superscript if raised).
+using CodepointSizeTable = std::unordered_map<uint32_t, float>;
+
+// Record the sizes a codepoint appears at; keep the LARGEST (its "full-size"
+// appearance). A true sub/superscript of a character is always physically
+// smaller than that character's normal size, so the max is a robust nominal.
+void recordCodepointSize(CodepointSizeTable* table, uint32_t cp, float size) {
+    if (!table || cp <= 0x20 || size <= 0.0f) return;
+    auto it = table->find(cp);
+    if (it == table->end() || size > it->second) table->operator[](cp) = size;
+}
+
+// Classify one glyph. `nominalSize` is the cached full-size of the same
+// codepoint (0 if unknown); `lineBaseline` is the enclosing line's baseline,
+// used only to decide the direction (raised => superscript, lowered =>
+// subscript). Falls back to InlineKind::Text whenever the evidence is weak.
+InlineKind classifyGlyph(float charSize, float charBaseline, float nominalSize,
+                         float lineBaseline) {
+    if (nominalSize <= 0.0f || charSize <= 0.0f) return InlineKind::Text;
+    // A clear size reduction is required before we even consider a script.
+    if (charSize >= nominalSize * 0.85f) return InlineKind::Text;
+    // Direction from the baseline offset, in units of the glyph's own size.
     const float rise = charBaseline - lineBaseline;
-    const float sizeRatio = charSize / lineSize;
-
-    // Only act on a clearly smaller glyph; same-size text is never a script.
-    if (sizeRatio > 0.88f) return InlineKind::Text;
-
-    // Strong vertical offset decides the direction. Thresholds in em of the
-    // LINE size (an offset of ~0.30 em is unambiguous).
-    if (rise >  0.28f * lineSize) return InlineKind::Superscript;
-    if (rise < -0.18f * lineSize) return InlineKind::Subscript;
-
-    // A smaller glyph with only a slight offset is ambiguous (could be a
-    // math symbol such as '*' set in a smaller nominal size). Leave it as
-    // normal text to avoid false positives.
+    const float em = nominalSize;
+    if (rise >  0.25f * em) return InlineKind::Superscript;
+    if (rise < -0.15f * em) return InlineKind::Subscript;
+    // Smaller but no decisive offset: most likely a smaller math symbol or a
+    // glyph that differs for font reasons rather than a true script.
     return InlineKind::Text;
 }
 
@@ -115,7 +117,8 @@ fz_point charCenter(const fz_stext_char* ch) {
 struct CellChar { const fz_stext_line* line; const fz_stext_char* ch; };
 
 std::vector<InlineRun> cellRuns(fz_context* ctx, const std::vector<CellChar>& chars,
-                                int* boldChars, int* inkChars, float* sizeSum) {
+                                int* boldChars, int* inkChars, float* sizeSum,
+                                const CodepointSizeTable* cpSizes) {
     std::vector<InlineRun> runs;
     std::string buf;
     bool curBold = false, started = false;
@@ -136,6 +139,7 @@ std::vector<InlineRun> cellRuns(fz_context* ctx, const std::vector<CellChar>& ch
         lineSize = csizes[csizes.size() / 2];
         lineBaseline = cbaselines[cbaselines.size() / 2];
     }
+    (void)lineSize; // only the baseline is used for direction; size comes from the cache
     auto flush = [&] {
         if (buf.empty()) return;
         runs.push_back(InlineRun{curBold ? InlineKind::Strong : curKind, std::move(buf), 0});
@@ -150,7 +154,12 @@ std::vector<InlineRun> cellRuns(fz_context* ctx, const std::vector<CellChar>& ch
         curLine = cc.line;
         if (!started && c == ' ') continue;
         const bool bold = isBoldFont(ctx, cc.ch->font);
-        const InlineKind kind = classifyScript(cc.ch->size, cc.ch->origin.y, lineSize, lineBaseline);
+        float nominal = 0.0f;
+        if (cpSizes) {
+            auto it = cpSizes->find((uint32_t)c);
+            if (it != cpSizes->end()) nominal = it->second;
+        }
+        const InlineKind kind = classifyGlyph(cc.ch->size, cc.ch->origin.y, nominal, lineBaseline);
         if (started && (bold != curBold || kind != curKind) && c != ' ') flush();
         if (c != ' ') { curBold = bold; curKind = kind; }
         appendUtf8(buf, (uint32_t)c);
@@ -1119,7 +1128,8 @@ struct UntaggedAtom {
 };
 
 bool buildLineAtom(fz_context* ctx, fz_stext_line* line,
-                   const std::unordered_set<const fz_stext_char*>& skip, UntaggedAtom* a) {
+                   const std::unordered_set<const fz_stext_char*>& skip, UntaggedAtom* a,
+                   const CodepointSizeTable* cpSizes) {
     std::vector<PageChar> store;
     for (fz_stext_char* ch = line->first_char; ch; ch = ch->next) {
         if (ch->c <= 0 || ch->c == 0xFFFD || skip.count(ch)) continue;
@@ -1157,9 +1167,16 @@ bool buildLineAtom(fz_context* ctx, fz_stext_line* line,
     }
     a->geo.firstWordW = wordEnd - a->box.x0;
     RunBuilder all;
-    for (const PageChar* pc : chars)
+    const float lineBase = a->geo.baseline;
+    for (const PageChar* pc : chars) {
+        float nominal = 0.0f;
+        if (cpSizes) {
+            auto it = cpSizes->find((uint32_t)pc->ch->c);
+            if (it != cpSizes->end()) nominal = it->second;
+        }
         all.add((uint32_t)pc->ch->c, isBoldFont(ctx, pc->ch->font),
-                classifyScript(pc->ch->size, pc->ch->origin.y, a->geo.size, a->geo.baseline));
+                classifyGlyph(pc->ch->size, pc->ch->origin.y, nominal, lineBase));
+    }
     a->runs = all.take();
     const size_t from = splitListLabel(chars, &a->label, &a->ordered, &a->number, true);
     if (from > 0) {
@@ -1172,10 +1189,16 @@ bool buildLineAtom(fz_context* ctx, fz_stext_line* line,
             a->geo.itemTextX = charBox(chars[k]->ch).x0;
             a->geo.itemOrdered = a->ordered;
             RunBuilder body;
-            for (size_t j = from; j < chars.size(); ++j)
+            for (size_t j = from; j < chars.size(); ++j) {
+                float nominal = 0.0f;
+                if (cpSizes) {
+                    auto it = cpSizes->find((uint32_t)chars[j]->ch->c);
+                    if (it != cpSizes->end()) nominal = it->second;
+                }
                 body.add((uint32_t)chars[j]->ch->c, isBoldFont(ctx, chars[j]->ch->font),
-                         classifyScript(chars[j]->ch->size, chars[j]->ch->origin.y,
-                                        a->geo.size, a->geo.baseline));
+                         classifyGlyph(chars[j]->ch->size, chars[j]->ch->origin.y,
+                                       nominal, lineBase));
+            }
             a->bodyRuns = body.take();
         }
     } else {
@@ -1548,6 +1571,35 @@ bool parsePdf(const std::filesystem::path& path, Document* out, Logger* log,
             log->log(LogLevel::Info, "pdfin", msg);
         }
 
+        // --- FIRST PASS: build the per-codepoint nominal-size table ---------
+        // A full scan of every page is needed so that a subscript/superscript
+        // can be compared against the SAME character's full-size appearance,
+        // regardless of order (the sub/superscript may be encountered before
+        // the character's normal appearance).
+        CodepointSizeTable cpSizes;
+        {
+            fz_stext_options sopts{};
+            for (int i = 0; i < npages; ++i) {
+                if (currentJobCancelled()) break;
+                fz_page* page = fz_load_page(ctx, doc, i);
+                fz_stext_page* stext = fz_new_stext_page_from_page(ctx, page, &sopts);
+                for (fz_stext_block* tb = stext->first_block; tb; tb = tb->next) {
+                    if (tb->type != FZ_STEXT_BLOCK_TEXT) continue;
+                    for (fz_stext_line* line = tb->u.t.first_line; line; line = line->next)
+                        for (fz_stext_char* ch = line->first_char; ch; ch = ch->next)
+                            recordCodepointSize(&cpSizes, (uint32_t)ch->c, ch->size);
+                }
+                fz_drop_stext_page(ctx, stext);
+                fz_drop_page(ctx, page);
+            }
+        }
+        if (log) {
+            char msg[96];
+            std::snprintf(msg, sizeof(msg), "pdf reflow: codepoint size table = %zu entries",
+                          cpSizes.size());
+            log->log(LogLevel::Info, "pdfin", msg);
+        }
+
         int imageCount = 0;
         int coveredPageImageCount = 0;
         TaggedFlow flow;
@@ -1642,7 +1694,7 @@ bool parsePdf(const std::filesystem::path& path, Document* out, Logger* log,
                         cell.isHeader = meta[r][c].header;
                         cell.colspan = meta[r][c].colspan;
                         cell.rowspan = meta[r][c].rowspan;
-                        cell.runs = cellRuns(ctx, cellText[r][c], &rowBold[r], &rowInk[r], &rowSize[r]);
+                        cell.runs = cellRuns(ctx, cellText[r][c], &rowBold[r], &rowInk[r], &rowSize[r], &cpSizes);
                         filled += !cell.runs.empty();
                         row.cells.push_back(std::move(cell));
                     }
@@ -1807,7 +1859,7 @@ bool parsePdf(const std::filesystem::path& path, Document* out, Logger* log,
                         }
                         UntaggedAtom a;
                         a.page = i;
-                        if (buildLineAtom(ctx, line, tableChars, &a)) atoms.push_back(std::move(a));
+                        if (buildLineAtom(ctx, line, tableChars, &a, &cpSizes)) atoms.push_back(std::move(a));
                     }
                 }
                 const int figures = absorbVectorFigures(ctx, page, evidence, rejectedGrids, tableBoxes,
